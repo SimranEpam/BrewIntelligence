@@ -79,8 +79,12 @@ salesforce-docs:
       elif [ -n "${CI_COMMIT_BEFORE_SHA:-}" ] && \
            [ "${CI_COMMIT_BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]; then
         FROM="${CI_COMMIT_BEFORE_SHA}"
-      else
+      elif git rev-parse --verify --quiet "${TO}~1" > /dev/null; then
         FROM="$(git rev-parse "${TO}~1")"
+      else
+        # First commit in the repository: compare against the empty tree,
+        # so every component counts as new.
+        FROM="$(git hash-object -t tree /dev/null)"
       fi
       echo "FROM=${FROM}" >  range.env
       echo "TO=${TO}"     >> range.env

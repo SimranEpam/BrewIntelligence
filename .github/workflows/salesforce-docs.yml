@@ -65,8 +65,12 @@ jobs:
           elif [ "${{ github.event_name }}" = "push" ] && \
                [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
             FROM="${{ github.event.before }}"
-          else
+          elif git rev-parse --verify --quiet "${TO}~1" > /dev/null; then
             FROM="$(git rev-parse "${TO}~1")"
+          else
+            # First commit in the repository: compare against the empty tree,
+            # so every component counts as new.
+            FROM="$(git hash-object -t tree /dev/null)"
           fi
           echo "from=${FROM}" >> "$GITHUB_OUTPUT"
           echo "to=${TO}"     >> "$GITHUB_OUTPUT"
