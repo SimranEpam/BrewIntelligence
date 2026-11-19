@@ -1,0 +1,266 @@
+# Salesforce Documentation Agent (GitLab CI)
+#
+# GitLab equivalent of .github/workflows/salesforce-docs.yml.
+# On every merge to main that touches Salesforce metadata in the sample project:
+#   1. Detect changed metadata (git diff + sfdx-git-delta)
+#   2. Fill the matching template per component, using AI_PROVIDER:
+#        github-models (default)  ci/generate-docs.mjs -> GitHub Models API
+#        claude                   Claude Code CLI (headless)
+#   3. Check the output (placeholders, secrets, record IDs, "Manual notes")
+#   4. Push branch docs/auto-update and open a merge request to main
+#
+# Required CI/CD variables (Settings > CI/CD > Variables, masked + protected):
+#   GITHUB_MODELS_TOKEN GitHub fine-grained PAT with "Models: Read"  (github-models)
+#   ANTHROPIC_API_KEY   Anthropic API key with a spend limit         (claude)
+#   GITLAB_PUSH_TOKEN   Project access token, role Developer, scope write_repository
+#
+# Manual run: Build > Pipelines > Run pipeline on main, optionally set
+#   FROM_REF  compare from this ref (default: previous commit)
+#   DRY_RUN   "true" to skip the merge request and only keep artifacts
+
+stages:
+  - document
+
+variables:
+  PROJECT_DIR: sample-sfdx-project
+  SOURCE_DIR: sample-sfdx-project/force-app
+  DOCS_DIR: docs
+  AI_PROVIDER:
+    value: "github-models"
+    options: ["github-models", "claude"]
+    description: "Which model service writes the docs"
+  GITHUB_MODEL: openai/gpt-4.1        # any id from the GitHub Models catalog
+  CLAUDE_MODEL: claude-sonnet-5-5
+  MAX_CONTEXT_CHARS: "20000"          # per component; fits GitHub Models free-tier request limits
+  MAX_FILE_BYTES: "60000"
+  MAX_COMPONENTS: "25"
+  DOCS_BRANCH: docs/auto-update
+  GIT_DEPTH: "0"          # full history for git diff / sfdx-git-delta
+  FROM_REF:
+    value: ""
+    description: "Compare from this ref (default: previous commit)"
+  DRY_RUN:
+    value: "false"
+    options: ["false", "true"]
+    description: "true = print docs, do not open a merge request"
+
+salesforce-docs:
+  stage: document
+  image: node:22          # current Salesforce CLI needs Node 22+ (fails on Node 20)
+  timeout: 30m
+  resource_group: salesforce-docs   # one run at a time
+  rules:
+    # Merge/push to main that changes Salesforce metadata.
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes:
+        - sample-sfdx-project/force-app/**/*
+    # Manual "Run pipeline" from the UI on main.
+    - if: '$CI_PIPELINE_SOURCE == "web" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  # Shared runner asks jobs to use the cache: keep npm downloads between runs.
+  cache:
+    key: npm-node22
+    paths:
+      - .npm/
+  before_script:
+    - node --version
+    - npm config set cache "${CI_PROJECT_DIR}/.npm"
+    - npm install --global --prefer-offline --no-audit --no-fund @salesforce/cli
+    - if [ "${AI_PROVIDER}" = "claude" ]; then npm install --global --prefer-offline --no-audit --no-fund @anthropic-ai/claude-code; fi
+    - echo y | sf plugins install sfdx-git-delta
+    - sf --version
+    - git config user.name  "docs-agent"
+    - git config user.email "docs-agent@noreply.${CI_SERVER_HOST}"
+  script:
+    # ---- 1. Resolve commit range ---------------------------------------
+    - |
+      TO="${CI_COMMIT_SHA}"
+      if [ -n "${FROM_REF}" ]; then
+        FROM="${FROM_REF}"
+      elif [ -n "${CI_COMMIT_BEFORE_SHA:-}" ] && \
+           [ "${CI_COMMIT_BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]; then
+        FROM="${CI_COMMIT_BEFORE_SHA}"
+      else
+        FROM="$(git rev-parse "${TO}~1")"
+      fi
+      echo "FROM=${FROM}" >  range.env
+      echo "TO=${TO}"     >> range.env
+      echo "Comparing ${FROM}..${TO}"
+
+    # ---- 2. Detect changed metadata ------------------------------------
+    - |
+      . ./range.env
+      mkdir -p .sgd
+      sf sgd source delta \
+        --from "${FROM}" --to "${TO}" \
+        --source-dir "${SOURCE_DIR}" \
+        --output-dir .sgd \
+        --api-version 62.0
+      git diff --name-status "${FROM}" "${TO}" -- "${SOURCE_DIR}" > .sgd/changed-files.txt
+
+      echo "--- package.xml ---";            cat .sgd/package/package.xml
+      echo "--- destructiveChanges.xml ---"; cat .sgd/destructiveChanges/destructiveChanges.xml
+      echo "--- changed files ---";          cat .sgd/changed-files.txt
+
+      COUNT=$(wc -l < .sgd/changed-files.txt | tr -d ' ')
+      echo "COUNT=${COUNT}" >> range.env
+      if [ "${COUNT}" -gt "${MAX_COMPONENTS}" ]; then
+        echo "ERROR: ${COUNT} changed files exceeds MAX_COMPONENTS=${MAX_COMPONENTS}. Run manually with a narrower FROM_REF."
+        exit 1
+      fi
+
+    # ---- 3a. Generate documentation with GitHub Models ----------------
+    - |
+      . ./range.env
+      if [ "${COUNT}" = "0" ]; then echo "No metadata changes."; exit 0; fi
+      if [ "${AI_PROVIDER}" = "github-models" ]; then
+        echo "ACTIVE_MODEL=${GITHUB_MODEL}" >> range.env
+
+        echo "--- network check"
+        getent hosts models.github.ai || echo "DNS lookup for models.github.ai failed"
+        env | grep -iE '^(https?|no)_proxy=' | sed -E 's#//[^@/]*@#//***@#' || echo "no proxy variables set"
+
+        # NODE_USE_ENV_PROXY makes Node's fetch use HTTPS_PROXY like npm does (Node 22.21+).
+        NODE_USE_ENV_PROXY=1 MODEL="${GITHUB_MODEL}" TO="${TO}" node ci/generate-docs.mjs
+      fi
+
+    # ---- 3b. Generate documentation with Claude Code (headless) --------
+    - |
+      . ./range.env
+      if [ "${AI_PROVIDER}" = "claude" ]; then
+      echo "ACTIVE_MODEL=${CLAUDE_MODEL}" >> range.env
+
+      cat > .sgd/prompt.md <<'PROMPT'
+      You are the Salesforce documentation agent for this repository.
+      Follow the rules in `docs/prompts/system-prompt.md` exactly.
+
+      ## Changed metadata
+      - Changed files (git name-status): `.sgd/changed-files.txt`
+      - Added/modified components: `.sgd/package/package.xml`
+      - Deleted components: `.sgd/destructiveChanges/destructiveChanges.xml`
+      - Source root: `__SOURCE_DIR__`
+
+      ## For each added or modified component
+      1. Classify it and pick the template from `docs/templates/`:
+         | Source | Template | Output |
+         |---|---|---|
+         | `classes/*.cls` | `apex-class.md` | `docs/apex/<Name>.md` |
+         | `triggers/*.trigger` | `apex-trigger.md` | `docs/triggers/<Name>.md` |
+         | `lwc/<name>/*` | `lwc-component.md` | `docs/lwc/<name>.md` |
+         | `objects/<Obj>/**` | `custom-object.md` | `docs/objects/<Obj>.md` |
+         | `flows/*.flow-meta.xml` | `flow.md` | `docs/flows/<Name>.md` |
+         Test classes (`*Test.cls`) are not documented on their own; refer to them
+         from the class they test. Ignore files that match none of these.
+      2. Read the source, its `-meta.xml`, and the objects, fields, and classes it
+         references. If a file is larger than __MAX_FILE_BYTES__ bytes, read only the
+         first part and note the truncation in the doc.
+      3. Use `git log -3 --format="%h %ad %s" --date=short -- <file>` for "Change history".
+      4. Write the completed document to the output path. If the doc already exists,
+         copy its "## Manual notes" section (to end of file) exactly, byte for byte.
+      5. See `docs/sample-output/` for the expected style.
+
+      ## For each deleted component
+      Do not delete the doc. Add this line directly under the title:
+      `> **Deprecated:** source removed in __TO__.`
+
+      ## Index
+      Regenerate `docs/index.md`: one table per component type listing every doc in
+      `docs/apex`, `docs/triggers`, `docs/lwc`, `docs/objects`, and `docs/flows`
+      with a link and a one-line summary, followed by a Mermaid diagram of object
+      relationships taken from the object docs.
+
+      ## Limits
+      - Only write inside `docs/apex`, `docs/triggers`, `docs/lwc`, `docs/objects`,
+        `docs/flows`, and `docs/index.md`. Never edit templates, prompts, or source.
+      - Do not commit, push, or create branches. The pipeline handles that.
+      PROMPT
+
+      sed -i \
+        -e "s#__SOURCE_DIR__#${SOURCE_DIR}#g" \
+        -e "s#__MAX_FILE_BYTES__#${MAX_FILE_BYTES}#g" \
+        -e "s#__TO__#${TO}#g" \
+        .sgd/prompt.md
+
+      claude -p "$(cat .sgd/prompt.md)" \
+        --model "${CLAUDE_MODEL}" \
+        --max-turns 40 \
+        --permission-mode acceptEdits \
+        --allowedTools "Read,Write,Edit,Glob,Grep,Bash(git log:*),Bash(git show:*)" \
+        --output-format text
+      fi
+
+    # ---- 4. Check generated docs ---------------------------------------
+    - |
+      set -eu
+      CHANGED=$(git status --porcelain -uall -- "${DOCS_DIR}" | awk '{print $2}' | grep '\.md$' || true)
+      if [ -z "${CHANGED}" ]; then echo "No documentation changes."; exit 0; fi
+      echo "Changed docs:"; echo "${CHANGED}"
+      FAIL=0
+      for f in ${CHANGED}; do
+        case "$f" in
+          docs/apex/*|docs/triggers/*|docs/lwc/*|docs/objects/*|docs/flows/*|docs/index.md) ;;
+          *) echo "ERROR $f: agent wrote outside the allowed folders"; FAIL=1; continue ;;
+        esac
+        if grep -n '{{' "$f"; then
+          echo "ERROR $f: unfilled template placeholder"; FAIL=1
+        fi
+        if grep -nE 'sk-ant-[A-Za-z0-9_-]+|00D[A-Za-z0-9]{12}([A-Za-z0-9]{3})?\b|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}|[a-z0-9-]+\.(my\.)?salesforce\.com|-----BEGIN [A-Z ]*PRIVATE KEY-----' "$f"; then
+          echo "ERROR $f: possible secret, record ID, email, or org URL"; FAIL=1
+        fi
+        if git cat-file -e "HEAD:$f" 2>/dev/null; then
+          OLD=$(git show "HEAD:$f" | sed -n '/^## Manual notes/,$p')
+          NEW=$(sed -n '/^## Manual notes/,$p' "$f")
+          if [ "$OLD" != "$NEW" ]; then
+            echo "ERROR $f: Manual notes section was changed"; FAIL=1
+          fi
+        fi
+      done
+      # All script entries run in one shell, so only exit on failure.
+      if [ "${FAIL}" -ne 0 ]; then exit 1; fi
+
+    # ---- 5. Dry run: print docs ----------------------------------------
+    - |
+      if [ "${DRY_RUN}" = "true" ]; then
+        git status --porcelain -uall -- "${DOCS_DIR}"
+        git diff -- "${DOCS_DIR}"
+        for f in $(git ls-files --others --exclude-standard -- "${DOCS_DIR}"); do
+          echo "===== $f ====="; cat "$f"
+        done
+      fi
+
+    # ---- 6. Push branch and open merge request -------------------------
+    - |
+      . ./range.env
+      if [ "${DRY_RUN}" = "true" ]; then echo "Dry run: no merge request."; exit 0; fi
+
+      git checkout -B "${DOCS_BRANCH}"
+      for p in docs/apex docs/triggers docs/lwc docs/objects docs/flows docs/index.md; do
+        if [ -e "$p" ]; then git add -A -- "$p"; fi
+      done
+      if git diff --cached --quiet; then echo "Nothing to commit."; exit 0; fi
+
+      git commit -m "docs: update Salesforce component documentation" \
+                 -m "Metadata changed in ${FROM}..${TO}. Generated with ${ACTIVE_MODEL}."
+
+      # Push options create the MR on first push and update it afterwards.
+      git push --force \
+        "https://oauth2:${GITLAB_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" \
+        "HEAD:refs/heads/${DOCS_BRANCH}" \
+        -o ci.skip \
+        -o merge_request.create \
+        -o merge_request.target="${CI_DEFAULT_BRANCH}" \
+        -o merge_request.title="docs: update Salesforce component documentation" \
+        -o merge_request.description="Automated docs for ${FROM}..${TO}. Check that descriptions match the code, no secrets or record IDs appear, and Manual notes are unchanged." \
+        -o merge_request.label="documentation" \
+        -o merge_request.label="automated" \
+        -o merge_request.remove_source_branch
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - .sgd/
+      - docs/apex/
+      - docs/triggers/
+      - docs/lwc/
+      - docs/objects/
+      - docs/flows/
+      - docs/index.md

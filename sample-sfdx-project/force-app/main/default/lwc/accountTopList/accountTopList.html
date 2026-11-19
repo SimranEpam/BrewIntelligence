@@ -1,0 +1,16 @@
+<template>
+    <lightning-card title="Top Accounts by Revenue" icon-name="standard:account">
+        <template if:true={accounts}>
+            <ul class="slds-p-horizontal_small">
+                <template for:each={accounts} for:item="acc">
+                    <li key={acc.Id} class="slds-p-vertical_xx-small">
+                        {acc.Name}
+                    </li>
+                </template>
+            </ul>
+        </template>
+        <template if:true={error}>
+            <p class="slds-p-horizontal_small slds-text-color_error">Unable to load accounts.</p>
+        </template>
+    </lightning-card>
+</template>
