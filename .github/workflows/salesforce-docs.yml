@@ -1,87 +1,114 @@
 # Salesforce Documentation Agent
 #
-# On every merge to main that touches Salesforce metadata in the sample project:
-#   1. Detect changed metadata (git diff + sfdx-git-delta)
-#   2. Ask Claude to fill the matching template for each changed component
+# On every pull request (opened/updated) that touches Salesforce metadata in
+# the sample project:
+#   1. Detect changed metadata between the PR's base and head (git diff + sfdx-git-delta)
+#   2. Fill the matching template for each changed component with GitHub Models
+#      (ci/generate-docs.mjs)
 #   3. Check the output (placeholders, secrets, record IDs, "Manual notes")
-#   4. Open a PR from docs/auto-update to main for human review
+#   4. Commit the generated docs directly onto the PR's own branch
+#
+# Docs are generated once, at PR time, so the PR is reviewed and merged with
+# its documentation already in place. Follow-up commits to the same PR
+# (`synchronize`) re-run the agent; the loop guard below skips the run when
+# the triggering commit is the agent's own docs commit, so it won't trigger
+# itself forever.
+#
+# Limitation: pull_request runs from a forked repository get a read-only
+# GITHUB_TOKEN, so the push step will fail for fork PRs. That's fine for this
+# repository's internal branches; cross-fork contributions would need a
+# different token (e.g. a PAT) to push docs back.
 #
 # See docs/architecture.md for the full design.
-# Required secret: ANTHROPIC_API_KEY
+# No secrets needed: the built-in GITHUB_TOKEN authenticates to GitHub Models
+# via the `models: read` permission above. GitHub Models must be available to
+# the repository/organization (Settings > Models, if your org restricts it).
 
 name: Salesforce Docs Agent
 
 on:
-  push:
-    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
     paths:
       - "sample-sfdx-project/force-app/**"
   workflow_dispatch:
     inputs:
-      from_ref:
-        description: "Compare from this ref (default: previous commit)"
-        required: false
-        default: ""
       dry_run:
-        description: "Print generated docs instead of opening a PR"
+        description: "Print generated docs instead of committing them"
         type: boolean
         default: false
 
-# One run at a time; a newer merge replaces a queued run.
+# A new push to the PR supersedes any in-flight run for that same PR.
 concurrency:
-  group: salesforce-docs
-  cancel-in-progress: false
+  group: salesforce-docs-${{ github.event.pull_request.number || 'manual' }}
+  cancel-in-progress: true
 
 permissions:
   contents: write
   pull-requests: write
-  id-token: write
+  models: read   # lets the built-in GITHUB_TOKEN call GitHub Models
 
 env:
   PROJECT_DIR: sample-sfdx-project
   SOURCE_DIR: sample-sfdx-project/force-app
   DOCS_DIR: docs
-  MODEL: claude-sonnet-5-5
-  MAX_FILE_BYTES: "60000"
+  MODEL: openai/gpt-4.1   # any id from the GitHub Models catalog
+  MAX_CONTEXT_CHARS: "20000"
   MAX_COMPONENTS: "25"
+  DOCS_BOT_EMAIL: docs-agent@noreply.github.com
 
 jobs:
   document:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
 
     steps:
-      - name: Check out repository
+      - name: Check out PR head branch
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
 
-      - name: Resolve commit range
-        id: range
+      - name: Skip if triggered by the docs agent's own commit
+        id: guard
         run: |
-          TO="${GITHUB_SHA}"
-          if [ -n "${{ inputs.from_ref }}" ]; then
-            FROM="${{ inputs.from_ref }}"
-          elif [ "${{ github.event_name }}" = "push" ] && \
-               [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
-            FROM="${{ github.event.before }}"
-          elif git rev-parse --verify --quiet "${TO}~1" > /dev/null; then
-            FROM="$(git rev-parse "${TO}~1")"
+          AUTHOR_EMAIL="$(git log -1 --format='%ae')"
+          SUBJECT="$(git log -1 --format='%s')"
+          if [ "${AUTHOR_EMAIL}" = "${DOCS_BOT_EMAIL}" ] || [[ "${SUBJECT}" == docs:* ]]; then
+            echo "Head commit was made by the docs agent itself; skipping to avoid a trigger loop."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
           else
-            # First commit in the repository: compare against the empty tree,
-            # so every component counts as new.
-            FROM="$(git hash-object -t tree /dev/null)"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve diff range
+        id: range
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            FROM="${{ github.event.pull_request.base.sha }}"
+            TO="${{ github.event.pull_request.head.sha }}"
+          else
+            TO="${GITHUB_SHA}"
+            if git rev-parse --verify --quiet "${TO}~1" > /dev/null; then
+              FROM="$(git rev-parse "${TO}~1")"
+            else
+              FROM="$(git hash-object -t tree /dev/null)"
+            fi
           fi
           echo "from=${FROM}" >> "$GITHUB_OUTPUT"
           echo "to=${TO}"     >> "$GITHUB_OUTPUT"
           echo "Comparing ${FROM}..${TO}"
 
       - name: Set up Node.js
+        if: steps.guard.outputs.skip != 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "22"   # current Salesforce CLI needs Node 22+
 
       - name: Install Salesforce CLI and sfdx-git-delta
+        if: steps.guard.outputs.skip != 'true'
         run: |
           npm install --global @salesforce/cli
           echo y | sf plugins install sfdx-git-delta
@@ -89,6 +116,7 @@ jobs:
 
       - name: Detect changed metadata
         id: delta
+        if: steps.guard.outputs.skip != 'true'
         run: |
           mkdir -p .sgd
           sf sgd source delta \
@@ -114,62 +142,15 @@ jobs:
             exit 1
           fi
 
-      - name: Generate documentation with Claude
-        if: steps.delta.outputs.count != '0'
-        uses: anthropics/claude-code-action@v1
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          claude_args: >-
-            --model ${{ env.MODEL }}
-            --max-turns 40
-            --allowedTools "Read,Write,Edit,Glob,Grep,Bash(git log:*),Bash(git show:*)"
-          prompt: |
-            You are the Salesforce documentation agent for this repository.
-            Follow the rules in `docs/prompts/system-prompt.md` exactly.
-
-            ## Changed metadata
-            - Changed files (git name-status): `.sgd/changed-files.txt`
-            - Added/modified components: `.sgd/package/package.xml`
-            - Deleted components: `.sgd/destructiveChanges/destructiveChanges.xml`
-            - Source root: `${{ env.SOURCE_DIR }}`
-
-            ## For each added or modified component
-            1. Classify it and pick the template from `docs/templates/`:
-               | Source | Template | Output |
-               |---|---|---|
-               | `classes/*.cls` | `apex-class.md` | `docs/apex/<Name>.md` |
-               | `triggers/*.trigger` | `apex-trigger.md` | `docs/triggers/<Name>.md` |
-               | `lwc/<name>/*` | `lwc-component.md` | `docs/lwc/<name>.md` |
-               | `objects/<Obj>/**` | `custom-object.md` | `docs/objects/<Obj>.md` |
-               | `flows/*.flow-meta.xml` | `flow.md` | `docs/flows/<Name>.md` |
-               Test classes (`*Test.cls`) are not documented on their own; refer to them
-               from the class they test. Ignore files that match none of these.
-            2. Read the source, its `-meta.xml`, and the objects, fields, and classes it
-               references. If a file is larger than ${{ env.MAX_FILE_BYTES }} bytes, read only the
-               first part and note the truncation in the doc.
-            3. Use `git log -3 --format="%h %ad %s" --date=short -- <file>` for "Change history".
-            4. Write the completed document to the output path. If the doc already exists,
-               copy its "## Manual notes" section (to end of file) exactly, byte for byte.
-            5. See `docs/sample-output/` for the expected style.
-
-            ## For each deleted component
-            Do not delete the doc. Add this line directly under the title:
-            `> **Deprecated:** source removed in ${{ steps.range.outputs.to }}.`
-
-            ## Index
-            Regenerate `docs/index.md`: one table per component type listing every doc in
-            `docs/apex`, `docs/triggers`, `docs/lwc`, `docs/objects`, and `docs/flows`
-            with a link and a one-line summary, followed by a Mermaid diagram of object
-            relationships taken from the object docs.
-
-            ## Limits
-            - Only write inside `docs/apex`, `docs/triggers`, `docs/lwc`, `docs/objects`,
-              `docs/flows`, and `docs/index.md`. Never edit templates, prompts, or source.
-            - Do not commit, push, or create branches. The workflow handles that.
+      - name: Generate documentation with GitHub Models
+        if: steps.guard.outputs.skip != 'true' && steps.delta.outputs.count != '0'
+        env:
+          GITHUB_MODELS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TO: ${{ steps.range.outputs.to }}
+        run: node ci/generate-docs.mjs
 
       - name: Check generated docs
-        if: steps.delta.outputs.count != '0'
+        if: steps.guard.outputs.skip != 'true' && steps.delta.outputs.count != '0'
         run: |
           set -euo pipefail
           CHANGED=$(git status --porcelain -uall -- "${DOCS_DIR}" | awk '{print $2}' | grep '\.md$' || true)
@@ -210,7 +191,7 @@ jobs:
           exit "${FAIL}"
 
       - name: Print docs (dry run)
-        if: steps.delta.outputs.count != '0' && inputs.dry_run
+        if: steps.guard.outputs.skip != 'true' && steps.delta.outputs.count != '0' && inputs.dry_run
         run: |
           git status --porcelain -- "${DOCS_DIR}"
           git diff -- "${DOCS_DIR}"
@@ -218,30 +199,21 @@ jobs:
             echo "===== $f ====="; cat "$f"
           done
 
-      - name: Open documentation pull request
-        if: steps.delta.outputs.count != '0' && !inputs.dry_run
-        uses: peter-evans/create-pull-request@v7
-        with:
-          branch: docs/auto-update
-          base: main
-          add-paths: |
-            docs/apex/**
-            docs/triggers/**
-            docs/lwc/**
-            docs/objects/**
-            docs/flows/**
-            docs/index.md
-          commit-message: "docs: update Salesforce component documentation"
-          title: "docs: update Salesforce component documentation"
-          labels: documentation, automated
-          delete-branch: true
-          body: |
-            Automated documentation update for metadata changed in
-            `${{ steps.range.outputs.from }}..${{ steps.range.outputs.to }}`.
+      - name: Commit documentation to the PR branch
+        if: steps.guard.outputs.skip != 'true' && steps.delta.outputs.count != '0' && !inputs.dry_run && github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          git config user.name "docs-agent"
+          git config user.email "${DOCS_BOT_EMAIL}"
 
-            **Reviewer checklist**
-            - [ ] Descriptions match what the code does
-            - [ ] No secrets, record IDs, emails, or org URLs
-            - [ ] "Manual notes" sections are unchanged
+          for p in docs/apex docs/triggers docs/lwc docs/objects docs/flows docs/index.md; do
+            if [ -e "$p" ]; then git add -A -- "$p"; fi
+          done
 
-            Generated by `.github/workflows/salesforce-docs.yml` using `${{ env.MODEL }}`.
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+            exit 0
+          fi
+
+          git commit -m "docs: update documentation for PR #${{ github.event.pull_request.number }}"
+          git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
