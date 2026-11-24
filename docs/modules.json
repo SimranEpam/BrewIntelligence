@@ -1,0 +1,21 @@
+{
+  "modules": {
+    "account-management": {
+      "title": "Account Management",
+      "description": "Account logic: service class, trigger, and the top accounts list component.",
+      "components": [
+        "apex-class:AccountService",
+        "apex-trigger:AccountTrigger",
+        "lwc:accountTopList"
+      ]
+    },
+    "invoicing": {
+      "title": "Invoicing",
+      "description": "Invoice data model and its validation flow.",
+      "components": [
+        "custom-object:Invoice__c",
+        "flow:Invoice_Validate_Amount"
+      ]
+    }
+  }
+}

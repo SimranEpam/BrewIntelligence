@@ -3,8 +3,9 @@
 # On every pull request (opened/updated) that touches Salesforce metadata in
 # the sample project:
 #   1. Detect changed metadata between the PR's base and head (git diff + sfdx-git-delta)
-#   2. Fill the matching template for each changed component with GitHub Models
-#      (ci/generate-docs.mjs)
+#   2. Map each changed component to its module (docs/modules.json) and update
+#      one document per affected module, docs/modules/<module>.md, with
+#      GitHub Models (ci/generate-docs.mjs)
 #   3. Check the output (placeholders, secrets, record IDs, "Manual notes")
 #   4. Commit the generated docs directly onto the PR's own branch
 #
@@ -53,7 +54,7 @@ env:
   SOURCE_DIR: sample-sfdx-project/force-app
   DOCS_DIR: docs
   MODEL: openai/gpt-4.1   # any id from the GitHub Models catalog
-  MAX_CONTEXT_CHARS: "20000"
+  MAX_CONTEXT_CHARS: "30000"
   MAX_COMPONENTS: "25"
   DOCS_BOT_EMAIL: docs-agent@noreply.github.com
 
@@ -164,7 +165,7 @@ jobs:
           for f in ${CHANGED}; do
             # Only generated folders may change.
             case "$f" in
-              docs/apex/*|docs/triggers/*|docs/lwc/*|docs/objects/*|docs/flows/*|docs/index.md) ;;
+              docs/modules/*|docs/index.md) ;;
               *) echo "::error file=$f::Agent wrote outside the allowed folders"; FAIL=1; continue ;;
             esac
 
@@ -206,7 +207,7 @@ jobs:
           git config user.name "docs-agent"
           git config user.email "${DOCS_BOT_EMAIL}"
 
-          for p in docs/apex docs/triggers docs/lwc docs/objects docs/flows docs/index.md; do
+          for p in docs/modules docs/index.md; do
             if [ -e "$p" ]; then git add -A -- "$p"; fi
           done
 

@@ -1,24 +1,34 @@
 #!/usr/bin/env node
 // Salesforce documentation generator using GitHub Models.
 //
+// One document per MODULE (docs/modules/<module>.md). A module groups any
+// number of Apex classes, triggers, LWCs, objects, and flows, as declared in
+// docs/modules.json.
+//
 // Reads the change list written by the pipeline (.sgd/changed-files.txt),
-// builds one request per changed component (source + related metadata +
-// template + system prompt), calls the GitHub Models chat completions API,
-// and writes docs/<type>/<Name>.md. Then regenerates docs/index.md.
+// maps every changed component to its module, and for each affected module
+// builds one request (all module sources + template + system prompt), calls
+// the GitHub Models chat completions API, and writes docs/modules/<id>.md.
+// Then regenerates docs/index.md.
 //
 // The model only writes the body of each doc. This script:
+//   - decides which modules to update (from file paths and the manifest)
 //   - restores the existing "## Manual notes" section byte for byte
-//   - marks docs of deleted components as deprecated (no model call)
+//   - marks the doc of a module whose components were all removed as deprecated
 //   - builds docs/index.md and the object relationship diagram itself
+//
+// Components not listed in docs/modules.json go to the "unassigned" module,
+// so nothing is silently dropped.
 //
 // No dependencies; needs Node 20+ (global fetch).
 //
 // Environment:
-//   GITHUB_MODELS_TOKEN  GitHub PAT with the "Models: Read" permission (required)
+//   GITHUB_MODELS_TOKEN  GitHub token with the "Models: Read" permission (required)
 //   MODEL                GitHub Models id, e.g. openai/gpt-4.1 (default)
 //   SOURCE_DIR           e.g. sample-sfdx-project/force-app
 //   TO                   commit SHA being documented (for deprecation notes)
-//   MAX_CONTEXT_CHARS    total characters of source sent per component (default 20000)
+//   MAX_CONTEXT_CHARS    total characters of source sent per module (default 30000)
+//   MODULES_FILE         module manifest (default docs/modules.json)
 //   MODELS_ENDPOINT      override the API URL (used for local testing)
 //   PROMPT_ONLY=true     print prompts instead of calling the API (no token needed)
 
@@ -30,18 +40,20 @@ const env = process.env;
 const SOURCE_DIR = (env.SOURCE_DIR || "sample-sfdx-project/force-app").replace(/\\/g, "/");
 const MODEL = env.MODEL || "openai/gpt-4.1";
 const TO = env.TO || "HEAD";
-const MAX_CONTEXT_CHARS = Number(env.MAX_CONTEXT_CHARS || 20000);
+const MAX_CONTEXT_CHARS = Number(env.MAX_CONTEXT_CHARS || 30000);
 const ENDPOINT = env.MODELS_ENDPOINT || "https://models.github.ai/inference/chat/completions";
 const PROMPT_ONLY = env.PROMPT_ONLY === "true";
 const CHANGES_FILE = ".sgd/changed-files.txt";
+const MODULES_FILE = env.MODULES_FILE || "docs/modules.json";
+const MODULES_DIR = "docs/modules";
+const MODULE_TEMPLATE = "docs/templates/module.md";
 const MANUAL_HEADING = "## Manual notes";
 
-const TYPES = {
-  "apex-class":    { template: "apex-class.md",    outDir: "docs/apex" },
-  "apex-trigger":  { template: "apex-trigger.md",  outDir: "docs/triggers" },
-  "lwc":           { template: "lwc-component.md", outDir: "docs/lwc" },
-  "custom-object": { template: "custom-object.md", outDir: "docs/objects" },
-  "flow":          { template: "flow.md",          outDir: "docs/flows" },
+const UNASSIGNED = {
+  id: "unassigned",
+  title: "Unassigned components",
+  description: `Components not listed in ${MODULES_FILE}. Add them to a module to group them.`,
+  patterns: [],
 };
 
 // ---------------------------------------------------------------- helpers
@@ -103,7 +115,7 @@ function readChanges() {
     const status = parts[0][0];
     // Renames list old and new path; treat as delete of old + add of new.
     const entries = status === "R" ? [["D", parts[1]], ["A", parts[2]]] : [[status, parts[1]]];
-    for (const [st, file] of entries) {
+    for (const [, file] of entries) {
       const c = classify(posix(file));
       if (!c) continue;
       if (c.type === "apex-class" && /Test$/.test(c.name)) {
@@ -115,12 +127,62 @@ function readChanges() {
         continue;
       }
       const key = `${c.type}:${c.name}`;
-      if (!components.has(key)) components.set(key, { ...c, touched: [] });
-      components.get(key).touched?.push(st);
+      if (!components.has(key)) components.set(key, { ...c });
     }
   }
   for (const c of components.values()) c.deleted = !mainSource(c).some(exists);
   return [...components.values()];
+}
+
+// Every component currently in the repo (test classes excluded).
+function allComponents() {
+  const seen = new Map();
+  for (const file of listFiles(SOURCE_DIR)) {
+    const c = classify(file);
+    if (!c || (c.type === "apex-class" && /Test$/.test(c.name))) continue;
+    const key = `${c.type}:${c.name}`;
+    if (!seen.has(key)) seen.set(key, { ...c, deleted: false });
+  }
+  return [...seen.values()];
+}
+
+// ---------------------------------------------------------------- modules
+
+const globToRegExp = (g) =>
+  new RegExp(`^${g.split("*").map((s) => s.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*")}$`);
+
+// docs/modules.json:
+//   { "modules": { "<id>": { "title": "...", "description": "...",
+//                            "components": ["apex-class:AccountService", "lwc:account*"] } } }
+// Component keys are "<type>:<name>" with "*" wildcards. First matching module wins.
+function loadManifest() {
+  if (!exists(MODULES_FILE)) throw new Error(`${MODULES_FILE} not found`);
+  const modules = JSON.parse(read(MODULES_FILE)).modules || {};
+  return Object.entries(modules).map(([id, def]) => ({
+    id,
+    title: def.title || id,
+    description: def.description || "",
+    patterns: (def.components || []).map(globToRegExp),
+  }));
+}
+
+function planModules(manifest, changed) {
+  const slots = new Map(); // module id -> { mod, components: Map<key, component> }
+  const slot = (mod) => {
+    if (!slots.has(mod.id)) slots.set(mod.id, { mod, components: new Map() });
+    return slots.get(mod.id);
+  };
+  const moduleOf = (c) =>
+    manifest.find((m) => m.patterns.some((re) => re.test(`${c.type}:${c.name}`))) ?? UNASSIGNED;
+
+  for (const c of allComponents()) slot(moduleOf(c)).components.set(`${c.type}:${c.name}`, { ...c, changed: false });
+  for (const c of changed) {
+    const s = slot(moduleOf(c));
+    const key = `${c.type}:${c.name}`;
+    s.components.set(key, { ...(s.components.get(key) ?? c), deleted: c.deleted, changed: true });
+  }
+  // Only modules with at least one changed component are regenerated.
+  return [...slots.values()].filter((s) => [...s.components.values()].some((c) => c.changed));
 }
 
 // ---------------------------------------------------------------- context
@@ -132,7 +194,7 @@ function mainSource({ type, root, name }) {
   switch (type) {
     case "apex-class":    return [`${root}/classes/${name}.cls`, `${root}/classes/${name}.cls-meta.xml`];
     case "apex-trigger":  return [`${root}/triggers/${name}.trigger`, `${root}/triggers/${name}.trigger-meta.xml`];
-    // Main file first, so source_path points at it.
+    // Main file first, so it is read before helper files.
     case "lwc":           return mainFirst(listFiles(`${root}/lwc/${name}`).filter((f) => !f.includes("/__tests__/")), `/${name}.js`);
     case "custom-object": return mainFirst(listFiles(`${root}/objects/${name}`), `/${name}.object-meta.xml`);
     case "flow":          return [`${root}/flows/${name}.flow-meta.xml`];
@@ -140,46 +202,15 @@ function mainSource({ type, root, name }) {
   return [];
 }
 
-// Files referenced by the component: Apex classes it calls, its test class,
-// Jest tests, and a field summary of every object it names.
-function relatedMetadata(c, sourceText) {
-  const { root, name, type } = c;
-  const related = [];
-  const classes = listFiles(`${root}/classes`).filter((f) => f.endsWith(".cls"));
+// Field summary of every object that the module's source names.
+function objectSummaries(root, ownObjects, sourceText) {
   const objects = exists(`${root}/objects`) ? fs.readdirSync(`${root}/objects`) : [];
-
-  for (const f of classes) {
-    const cls = path.basename(f, ".cls");
-    if (type === "apex-class" && cls === name) continue;
-    const isTest = cls === `${name}Test`;
-    const referenced = new RegExp(`\\b${cls}\\b`).test(sourceText);
-    if (isTest || referenced) related.push({ path: f, note: isTest ? "test class" : "referenced class" });
-  }
-  if (type === "lwc") {
-    for (const f of listFiles(`${root}/lwc/${name}/__tests__`)) related.push({ path: f, note: "Jest test" });
-  }
-  if (type === "apex-class" || type === "apex-trigger") {
-    // Triggers that call this class, so "Entry points" can be filled.
-    for (const f of listFiles(`${root}/triggers`).filter((f) => f.endsWith(".trigger"))) {
-      if (type === "apex-class" && new RegExp(`\\b${name}\\b`).test(read(f))) {
-        related.push({ path: f, note: "trigger that calls this class" });
-      }
-    }
-  }
-  if (type === "custom-object") {
-    for (const f of [...listFiles(`${root}/triggers`), ...listFiles(`${root}/flows`)]) {
-      if (/\.(trigger|flow-meta\.xml)$/.test(f) && read(f).includes(name)) {
-        related.push({ path: f, note: "automation on this object (name match)" });
-      }
-    }
-  }
-  const objectSummaries = objects
-    .filter((o) => o !== name && new RegExp(`\\b${o}\\b`).test(sourceText))
+  return objects
+    .filter((o) => !ownObjects.has(o) && new RegExp(`\\b${o}\\b`).test(sourceText))
     .map((o) => {
       const fields = listFiles(`${root}/objects/${o}/fields`).map((f) => path.basename(f).replace(".field-meta.xml", ""));
       return `- ${o}: fields ${fields.join(", ") || "none in repo"}`;
     });
-  return { related, objectSummaries };
 }
 
 // Concatenate files ({ path, note? }), spending at most `budget` characters in total.
@@ -227,10 +258,10 @@ function parseJson(res, body) {
   }
 }
 
-// One cheap call before any component: fail once with a clear reason
-// instead of failing every component with the same error.
+// One cheap call before any module: fail once with a clear reason
+// instead of failing every module with the same error.
 async function preflight() {
-  if (!env.GITHUB_MODELS_TOKEN) throw new Error("GITHUB_MODELS_TOKEN is not set for this job (is the branch protected?)");
+  if (!env.GITHUB_MODELS_TOKEN) throw new Error("GITHUB_MODELS_TOKEN is not set for this job");
   const url = new URL("/catalog/models", ENDPOINT).toString();
   let res;
   try {
@@ -251,7 +282,7 @@ async function preflight() {
   const models = parseJson(res, body);
   if (Array.isArray(models) && !models.some((m) => m.id === MODEL)) {
     const sample = models.map((m) => m.id).slice(0, 15).join(", ");
-    throw new Error(`Model "${MODEL}" is not in your GitHub Models catalog. Set GITHUB_MODEL to one of: ${sample}${models.length > 15 ? ", ..." : ""}`);
+    throw new Error(`Model "${MODEL}" is not in your GitHub Models catalog. Set MODEL to one of: ${sample}${models.length > 15 ? ", ..." : ""}`);
   }
   console.log(`preflight: GitHub Models reachable, model ${MODEL} available`);
 }
@@ -300,44 +331,76 @@ function unwrap(text) {
   return (m ? m[1] : text.trim()) + "\n";
 }
 
-// ---------------------------------------------------------------- per component
+// ---------------------------------------------------------------- per module
 
-async function documentComponent(c, systemPrompt) {
-  const { outDir, template } = TYPES[c.type];
-  const outPath = `${outDir}/${c.name}.md`;
+async function documentModule({ mod, components }, systemPrompt) {
+  const comps = [...components.values()];
+  const live = comps.filter((c) => !c.deleted);
+  const outPath = `${MODULES_DIR}/${mod.id}.md`;
   const existing = exists(outPath) ? read(outPath) : null;
 
-  if (c.deleted) {
-    if (!existing) return console.log(`skip ${c.type} ${c.name}: deleted and never documented`);
-    const note = `> **Deprecated:** source removed in ${TO}.`;
+  if (!live.length) {
+    if (!existing) return console.log(`skip module ${mod.id}: all components removed and never documented`);
     if (existing.includes("> **Deprecated:**")) return;
-    const updated = existing.replace(/^(# .*\n)/, `$1\n${note}\n`);
-    fs.writeFileSync(outPath, updated);
+    const note = `> **Deprecated:** all components removed in ${TO}.`;
+    fs.writeFileSync(outPath, existing.replace(/^(# .*\n)/, `$1\n${note}\n`));
     return console.log(`deprecated ${outPath}`);
   }
 
-  const sources = mainSource(c).filter(exists);
-  const sourceText = sources.map(read).join("\n");
-  const { related, objectSummaries } = relatedMetadata(c, sourceText);
-  const templateText = read(`docs/templates/${template}`);
+  const templateText = read(MODULE_TEMPLATE);
   const [, templateManual] = splitManualNotes(templateText);
-  const existingManual = existing ? splitManualNotes(existing)[1] : null;
+  const [existingBody, existingManual] = existing ? splitManualNotes(existing) : [null, null];
   const manual = existingManual ?? templateManual ?? `${MANUAL_HEADING}\n`;
 
-  const sourceBudget = Math.floor(MAX_CONTEXT_CHARS * 0.75);
+  const filesOf = (c) => {
+    const files = mainSource(c).filter(exists).map((p) => ({ path: p }));
+    if (c.type === "apex-class") {
+      const test = `${c.root}/classes/${c.name}Test.cls`;
+      if (exists(test)) files.push({ path: test, note: "test class" });
+    }
+    return files;
+  };
+  const changedFiles = live.filter((c) => c.changed).flatMap(filesOf);
+  const unchangedFiles = live.filter((c) => !c.changed).flatMap(filesOf);
+
+  // Changed components get the largest share; unchanged ones are context only.
+  const existingBudget = existingBody ? Math.floor(MAX_CONTEXT_CHARS * 0.2) : 0;
+  const changedBudget = Math.floor(MAX_CONTEXT_CHARS * 0.5);
+  const unchangedBudget = MAX_CONTEXT_CHARS - existingBudget - changedBudget;
+
+  const allText = [...changedFiles, ...unchangedFiles].map((f) => read(f.path)).join("\n");
+  const ownObjects = new Set(live.filter((c) => c.type === "custom-object").map((c) => c.name));
+  const summaries = new Set();
+  for (const root of new Set(live.map((c) => c.root))) {
+    for (const s of objectSummaries(root, ownObjects, allText)) summaries.add(s);
+  }
+
+  const status = (c) => (c.deleted ? "removed in this change" : c.changed ? "changed in this change" : "unchanged");
+  const history = live
+    .filter((c) => c.changed)
+    .map((c) => `### ${c.name}\n${gitHistory(mainSource(c).filter(exists))}`)
+    .join("\n\n");
+
   const user = [
-    `component_type: ${c.type}`,
-    `source_path: ${sources[0]}`,
+    `module_id: ${mod.id}`,
+    `module_title: ${mod.title}`,
+    `module_description: ${mod.description || "Not available"}`,
     "",
-    "## source",
-    packFiles(sources.map((p) => ({ path: p })), sourceBudget),
+    "## components",
+    comps.map((c) => `- ${c.type} ${c.name}: ${status(c)}`).join("\n"),
     "",
-    "## related_metadata",
-    packFiles(related, MAX_CONTEXT_CHARS - sourceBudget) || "None found",
-    objectSummaries.length ? `\nReferenced objects:\n${objectSummaries.join("\n")}` : "",
+    "## changed_component_sources",
+    packFiles(changedFiles, changedBudget) || "None",
     "",
-    "## git_history",
-    gitHistory(sources),
+    "## unchanged_component_sources",
+    packFiles(unchangedFiles, unchangedBudget) || "None",
+    summaries.size ? `\nReferenced objects:\n${[...summaries].join("\n")}` : "",
+    "",
+    "## git_history (changed components)",
+    history || "Not available",
+    "",
+    "## existing_doc (current document; keep text about unchanged components)",
+    existingBody ? `\`\`\`markdown\n${existingBody.slice(0, existingBudget)}\n\`\`\`` : "None (first version of this module document)",
     "",
     "## template",
     "```markdown",
@@ -355,9 +418,8 @@ async function documentComponent(c, systemPrompt) {
 
   // Keep the model's body, force the original Manual notes section.
   const [body] = splitManualNotes(unwrap(answer));
-  const doc = `${body.trimEnd()}\n\n${manual.trimEnd()}\n`;
-  fs.mkdirSync(outDir, { recursive: true });
-  fs.writeFileSync(outPath, doc);
+  fs.mkdirSync(MODULES_DIR, { recursive: true });
+  fs.writeFileSync(outPath, `${body.trimEnd()}\n\n${manual.trimEnd()}\n`);
   console.log(`wrote ${outPath}`);
 }
 
@@ -386,28 +448,20 @@ function relationshipEdges() {
 }
 
 function writeIndex() {
-  const sections = [
-    ["Apex classes", "docs/apex"],
-    ["Apex triggers", "docs/triggers"],
-    ["Lightning Web Components", "docs/lwc"],
-    ["Custom objects", "docs/objects"],
-    ["Flows", "docs/flows"],
-  ];
   const out = [
-    "# Salesforce component index",
+    "# Salesforce module index",
     "",
     "> Auto-generated by the documentation agent. Do not edit by hand.",
     "",
   ];
-  for (const [title, dir] of sections) {
-    const docs = listFiles(dir).filter((f) => f.endsWith(".md")).sort();
-    if (!docs.length) continue;
-    out.push(`## ${title}`, "", "| Component | Summary |", "|---|---|");
+  const docs = listFiles(MODULES_DIR).filter((f) => f.endsWith(".md")).sort();
+  if (docs.length) {
+    out.push("## Modules", "", "| Module | Summary |", "|---|---|");
     for (const f of docs) {
       const text = read(f);
-      const name = path.basename(f, ".md");
+      const title = text.match(/^# (.+)$/m)?.[1] || path.basename(f, ".md");
       const deprecated = text.includes("> **Deprecated:**") ? " (deprecated)" : "";
-      out.push(`| [${name}](${path.posix.relative("docs", f)})${deprecated} | ${purposeLine(text) || "Not available"} |`);
+      out.push(`| [${title}](${path.posix.relative("docs", f)})${deprecated} | ${purposeLine(text) || "Not available"} |`);
     }
     out.push("");
   }
@@ -424,10 +478,14 @@ function writeIndex() {
 const systemPrompt = read("docs/prompts/system-prompt.md").split(/^---$/m).slice(1).join("---").trim()
   || read("docs/prompts/system-prompt.md");
 
-const components = readChanges();
-console.log(`components: ${components.map((c) => `${c.type}:${c.name}${c.deleted ? " (deleted)" : ""}`).join(", ") || "none"}`);
+const plan = planModules(loadManifest(), readChanges());
+for (const { mod, components } of plan) {
+  console.log(`module ${mod.id}: ${[...components.values()].map((c) => `${c.type}:${c.name}${c.deleted ? " (removed)" : c.changed ? " (changed)" : ""}`).join(", ")}`);
+  if (mod === UNASSIGNED) console.warn(`::warning::Components in "unassigned" are not listed in ${MODULES_FILE}; add them to a module.`);
+}
+if (!plan.length) console.log("modules: none affected");
 
-if (!PROMPT_ONLY && components.some((c) => !c.deleted)) {
+if (!PROMPT_ONLY && plan.some(({ components }) => [...components.values()].some((c) => !c.deleted))) {
   try {
     await preflight();
   } catch (err) {
@@ -437,16 +495,16 @@ if (!PROMPT_ONLY && components.some((c) => !c.deleted)) {
 }
 
 let failed = 0;
-for (const c of components) {
+for (const entry of plan) {
   try {
-    await documentComponent(c, systemPrompt);
+    await documentModule(entry, systemPrompt);
   } catch (err) {
     failed++;
-    console.error(`ERROR ${c.type} ${c.name}: ${err.message}`);
+    console.error(`ERROR module ${entry.mod.id}: ${err.message}`);
   }
 }
 if (!PROMPT_ONLY) writeIndex();
 if (failed) {
-  console.error(`${failed} component(s) failed`);
+  console.error(`${failed} module(s) failed`);
   process.exit(1);
 }
