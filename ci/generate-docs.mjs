@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Salesforce documentation generator using GitHub Models.
+// Salesforce documentation generator using any OpenAI-compatible chat completions
+// API (for example CodeMie / LiteLLM).
 //
 // One document per MODULE (docs/modules/<module>.md). A module groups any
 // number of Apex classes, triggers, LWCs, objects, and flows, as declared in
@@ -8,7 +9,7 @@
 // Reads the change list written by the pipeline (.sgd/changed-files.txt),
 // maps every changed component to its module, and for each affected module
 // builds one request (all module sources + template + system prompt), calls
-// the GitHub Models chat completions API, and writes docs/modules/<id>.md.
+// the chat completions API, and writes docs/modules/<id>.md.
 // Then regenerates docs/index.md.
 //
 // The model only writes the body of each doc. This script:
@@ -23,13 +24,13 @@
 // No dependencies; needs Node 20+ (global fetch).
 //
 // Environment:
-//   GITHUB_MODELS_TOKEN  GitHub token with the "Models: Read" permission (required)
-//   MODEL                GitHub Models id, e.g. openai/gpt-4.1 (default)
+//   LLM_ENDPOINT         full chat completions URL, e.g. https://<host>/v1/chat/completions (required)
+//   LLM_API_KEY          bearer token for that API (required)
+//   MODEL                model name as the API knows it (required)
 //   SOURCE_DIR           e.g. sample-sfdx-project/force-app
 //   TO                   commit SHA being documented (for deprecation notes)
 //   MAX_CONTEXT_CHARS    total characters of source sent per module (default 30000)
 //   MODULES_FILE         module manifest (default docs/modules.json)
-//   MODELS_ENDPOINT      override the API URL (used for local testing)
 //   PROMPT_ONLY=true     print prompts instead of calling the API (no token needed)
 
 import fs from "node:fs";
@@ -38,10 +39,11 @@ import { execFileSync } from "node:child_process";
 
 const env = process.env;
 const SOURCE_DIR = (env.SOURCE_DIR || "sample-sfdx-project/force-app").replace(/\\/g, "/");
-const MODEL = env.MODEL || "openai/gpt-4.1";
+const MODEL = env.MODEL || "";
 const TO = env.TO || "HEAD";
 const MAX_CONTEXT_CHARS = Number(env.MAX_CONTEXT_CHARS || 30000);
-const ENDPOINT = env.MODELS_ENDPOINT || "https://models.github.ai/inference/chat/completions";
+const ENDPOINT = env.LLM_ENDPOINT || "";
+const API_KEY = env.LLM_API_KEY || "";
 const PROMPT_ONLY = env.PROMPT_ONLY === "true";
 const CHANGES_FILE = ".sgd/changed-files.txt";
 const MODULES_FILE = env.MODULES_FILE || "docs/modules.json";
@@ -230,18 +232,14 @@ function packFiles(files, budget) {
 
 // ---------------------------------------------------------------- model call
 
-const API_HEADERS = () => ({
-  Authorization: `Bearer ${env.GITHUB_MODELS_TOKEN}`,
-  Accept: "application/vnd.github+json",
-  "X-GitHub-Api-Version": "2022-11-28",
-});
+const API_HEADERS = () => ({ Authorization: `Bearer ${API_KEY}` });
 
-// Describe who actually answered, for responses that are not GitHub's API.
+// Describe who actually answered, for responses that are not the model API.
 function describe(res, body) {
   const h = (k) => res.headers.get(k) || "-";
   return [
     `HTTP ${res.status} from ${res.url}`,
-    `content-type: ${h("content-type")}, server: ${h("server")}, via: ${h("via")}, x-github-request-id: ${h("x-github-request-id")}`,
+    `content-type: ${h("content-type")}, server: ${h("server")}, via: ${h("via")}`,
     `body (first 300 chars): ${JSON.stringify(body.slice(0, 300))}`,
   ].join("\n  ");
 }
@@ -251,48 +249,22 @@ function parseJson(res, body) {
     return JSON.parse(body);
   } catch {
     throw new Error(
-      `Response is not JSON, so it did not come from the GitHub Models API.\n  ${describe(res, body)}\n` +
-      "  Likely cause: a proxy or firewall on the runner network answered instead of GitHub.\n" +
-      "  Ask the runner admins to allow outbound HTTPS to models.github.ai.",
+      `Response is not JSON, so it did not come from the model API.\n  ${describe(res, body)}\n` +
+      "  Likely cause: LLM_ENDPOINT is wrong or retired, or a proxy answered instead of the API.\n" +
+      "  Check that LLM_ENDPOINT is the full chat completions URL.",
     );
   }
 }
 
-// One cheap call before any module: fail once with a clear reason
-// instead of failing every module with the same error.
-async function preflight() {
-  if (!env.GITHUB_MODELS_TOKEN) throw new Error("GITHUB_MODELS_TOKEN is not set for this job");
-  const url = new URL("/catalog/models", ENDPOINT).toString();
-  let res;
-  try {
-    res = await fetch(url, { headers: API_HEADERS() });
-  } catch (err) {
-    throw new Error(`Cannot reach ${url}: ${err.cause?.code || err.cause?.message || err.message}`);
+// Fail once with a clear reason instead of failing every module with the same error.
+function preflight() {
+  const missing = [["LLM_ENDPOINT", ENDPOINT], ["LLM_API_KEY", API_KEY], ["MODEL", MODEL]]
+    .filter(([, v]) => !v)
+    .map(([k]) => k);
+  if (missing.length) {
+    throw new Error(`Not set: ${missing.join(", ")}. Add them as repository secrets/variables (see the workflow header).`);
   }
-  const body = await res.text();
-  console.log(`preflight: ${describe(res, body).split("\n")[0]}`);
-  if (res.status === 401 || res.status === 403) {
-    throw new Error(`GitHub rejected GITHUB_MODELS_TOKEN.\n  ${describe(res, body)}\n  Check the token has "Models: Read" and has not expired.`);
-  }
-  if (!res.ok) {
-    // Catalog endpoint is only a check; let the real call decide.
-    console.warn(`preflight: catalog check returned HTTP ${res.status}, continuing`);
-    return;
-  }
-  let models;
-  try {
-    models = parseJson(res, body);
-  } catch (err) {
-    // The catalog is only a pre-check; if something other than the API answered,
-    // let the real model call decide and report its own error.
-    console.warn(`preflight: catalog response is not JSON, skipping the model check and continuing\n  ${describe(res, body)}`);
-    return;
-  }
-  if (Array.isArray(models) && !models.some((m) => m.id === MODEL)) {
-    const sample = models.map((m) => m.id).slice(0, 15).join(", ");
-    throw new Error(`Model "${MODEL}" is not in your GitHub Models catalog. Set MODEL to one of: ${sample}${models.length > 15 ? ", ..." : ""}`);
-  }
-  console.log(`preflight: GitHub Models reachable, model ${MODEL} available`);
+  console.log(`preflight: using model ${MODEL} at ${new URL(ENDPOINT).origin}`);
 }
 
 async function callModel(system, user) {
@@ -300,8 +272,6 @@ async function callModel(system, user) {
     console.log(`----- prompt (${user.length} chars) -----\n${user.slice(0, 1500)}\n...`);
     return null;
   }
-  const token = env.GITHUB_MODELS_TOKEN;
-  if (!token) throw new Error("GITHUB_MODELS_TOKEN is not set");
 
   for (let attempt = 1; attempt <= 4; attempt++) {
     const res = await fetch(ENDPOINT, {
@@ -329,7 +299,7 @@ async function callModel(system, user) {
       await new Promise((r) => setTimeout(r, wait * 1000));
       continue;
     }
-    throw new Error(`GitHub Models call failed.\n  ${describe(res, body)}`);
+    throw new Error(`Model API call failed.\n  ${describe(res, body)}`);
   }
 }
 
@@ -495,7 +465,7 @@ if (!plan.length) console.log("modules: none affected");
 
 if (!PROMPT_ONLY && plan.some(({ components }) => [...components.values()].some((c) => !c.deleted))) {
   try {
-    await preflight();
+    preflight();
   } catch (err) {
     console.error(`ERROR preflight: ${err.message}`);
     process.exit(1);

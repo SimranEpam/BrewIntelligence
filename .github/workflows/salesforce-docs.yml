@@ -5,7 +5,7 @@
 #   1. Detect changed metadata between the PR's base and head (git diff + sfdx-git-delta)
 #   2. Map each changed component to its module (docs/modules.json) and update
 #      one document per affected module, docs/modules/<module>.md, with
-#      GitHub Models (ci/generate-docs.mjs)
+#      an OpenAI-compatible model API such as CodeMie / LiteLLM (ci/generate-docs.mjs)
 #   3. Check the output (placeholders, secrets, record IDs, "Manual notes")
 #   4. Commit the generated docs directly onto the PR's own branch
 #
@@ -21,9 +21,11 @@
 # different token (e.g. a PAT) to push docs back.
 #
 # See docs/architecture.md for the full design.
-# No secrets needed: the built-in GITHUB_TOKEN authenticates to GitHub Models
-# via the `models: read` permission above. GitHub Models must be available to
-# the repository/organization (Settings > Models, if your org restricts it).
+# Setup (Settings > Secrets and variables > Actions):
+#   Secret   LLM_ENDPOINT  full chat completions URL, e.g. https://<host>/v1/chat/completions
+#   Secret   LLM_API_KEY   bearer token for that API
+#   Variable LLM_MODEL     model name as the API knows it
+# (GitHub Models was retired on 2026-07-30, so it can no longer be used.)
 
 name: Salesforce Docs Agent
 
@@ -47,13 +49,12 @@ concurrency:
 permissions:
   contents: write
   pull-requests: write
-  models: read   # lets the built-in GITHUB_TOKEN call GitHub Models
 
 env:
   PROJECT_DIR: sample-sfdx-project
   SOURCE_DIR: sample-sfdx-project/force-app
   DOCS_DIR: docs
-  MODEL: openai/gpt-4.1   # any id from the GitHub Models catalog
+  MODEL: ${{ vars.LLM_MODEL }}
   MAX_CONTEXT_CHARS: "30000"
   MAX_COMPONENTS: "25"
   DOCS_BOT_EMAIL: docs-agent@noreply.github.com
@@ -143,27 +144,11 @@ jobs:
             exit 1
           fi
 
-      - name: Network diagnostics (temporary)
-        if: steps.guard.outputs.skip != 'true' && steps.delta.outputs.count != '0'
-        continue-on-error: true
-        run: |
-          echo "runner: environment=${RUNNER_ENVIRONMENT:-unknown} name=${RUNNER_NAME:-unknown} os=${RUNNER_OS:-unknown}"
-          echo "--- proxy variables (credentials masked)"
-          env | grep -iE '^(https?|no|all)_proxy=' | sed -E 's#//[^@/]*@#//***@#' || echo "none set"
-          echo "--- DNS"
-          getent hosts models.github.ai || echo "DNS lookup failed"
-          getent hosts api.github.com || true
-          echo "--- TLS and response headers from models.github.ai"
-          curl -sS -m 20 -v -o /dev/null https://models.github.ai/catalog/models 2>&1 \
-            | grep -E '^\* (Uses proxy|Trying|Connected to|issuer:|subject:)|^< (HTTP|[Ss]erver|[Vv]ia|[Cc]ontent-[Tt]ype|[Xx]-)' || true
-          echo "--- same check against api.github.com (should return GitHub JSON headers)"
-          curl -sS -m 20 -v -o /dev/null https://api.github.com/zen 2>&1 \
-            | grep -E '^\* (Uses proxy|Connected to|issuer:)|^< (HTTP|[Ss]erver|[Vv]ia|[Xx]-[Gg]it[Hh]ub-[Rr]equest-[Ii]d)' || true
-
-      - name: Generate documentation with GitHub Models
+      - name: Generate documentation with the model API
         if: steps.guard.outputs.skip != 'true' && steps.delta.outputs.count != '0'
         env:
-          GITHUB_MODELS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           TO: ${{ steps.range.outputs.to }}
         run: node ci/generate-docs.mjs
 
