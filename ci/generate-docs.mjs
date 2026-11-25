@@ -279,7 +279,15 @@ async function preflight() {
     console.warn(`preflight: catalog check returned HTTP ${res.status}, continuing`);
     return;
   }
-  const models = parseJson(res, body);
+  let models;
+  try {
+    models = parseJson(res, body);
+  } catch (err) {
+    // The catalog is only a pre-check; if something other than the API answered,
+    // let the real model call decide and report its own error.
+    console.warn(`preflight: catalog response is not JSON, skipping the model check and continuing\n  ${describe(res, body)}`);
+    return;
+  }
   if (Array.isArray(models) && !models.some((m) => m.id === MODEL)) {
     const sample = models.map((m) => m.id).slice(0, 15).join(", ");
     throw new Error(`Model "${MODEL}" is not in your GitHub Models catalog. Set MODEL to one of: ${sample}${models.length > 15 ? ", ..." : ""}`);
