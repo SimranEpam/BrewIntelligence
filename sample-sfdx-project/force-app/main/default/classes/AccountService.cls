@@ -8,7 +8,7 @@ public with sharing class AccountService {
         ];
 
         for (Account acc : accounts) {
-            if (acc.AnnualRevenue != null && acc.AnnualRevenue >= 10000000) {
+            if (acc.AnnualRevenue != null && acc.AnnualRevenue >= 100000) {
                 acc.Rating = 'Hot';
             } else {
                 acc.Rating = 'Warm';
