@@ -143,6 +143,23 @@ jobs:
             exit 1
           fi
 
+      - name: Network diagnostics (temporary)
+        if: steps.guard.outputs.skip != 'true' && steps.delta.outputs.count != '0'
+        continue-on-error: true
+        run: |
+          echo "runner: environment=${RUNNER_ENVIRONMENT:-unknown} name=${RUNNER_NAME:-unknown} os=${RUNNER_OS:-unknown}"
+          echo "--- proxy variables (credentials masked)"
+          env | grep -iE '^(https?|no|all)_proxy=' | sed -E 's#//[^@/]*@#//***@#' || echo "none set"
+          echo "--- DNS"
+          getent hosts models.github.ai || echo "DNS lookup failed"
+          getent hosts api.github.com || true
+          echo "--- TLS and response headers from models.github.ai"
+          curl -sS -m 20 -v -o /dev/null https://models.github.ai/catalog/models 2>&1 \
+            | grep -E '^\* (Uses proxy|Trying|Connected to|issuer:|subject:)|^< (HTTP|[Ss]erver|[Vv]ia|[Cc]ontent-[Tt]ype|[Xx]-)' || true
+          echo "--- same check against api.github.com (should return GitHub JSON headers)"
+          curl -sS -m 20 -v -o /dev/null https://api.github.com/zen 2>&1 \
+            | grep -E '^\* (Uses proxy|Connected to|issuer:)|^< (HTTP|[Ss]erver|[Vv]ia|[Xx]-[Gg]it[Hh]ub-[Rr]equest-[Ii]d)' || true
+
       - name: Generate documentation with GitHub Models
         if: steps.guard.outputs.skip != 'true' && steps.delta.outputs.count != '0'
         env:
