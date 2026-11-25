@@ -5,7 +5,7 @@
 #   1. Detect changed metadata between the PR's base and head (git diff + sfdx-git-delta)
 #   2. Map each changed component to its module (docs/modules.json) and update
 #      one document per affected module, docs/modules/<module>.md, with
-#      an OpenAI-compatible model API such as CodeMie / LiteLLM (ci/generate-docs.mjs)
+#      GitHub Copilot CLI (ci/generate-docs.mjs)
 #   3. Check the output (placeholders, secrets, record IDs, "Manual notes")
 #   4. Commit the generated docs directly onto the PR's own branch
 #
@@ -21,11 +21,14 @@
 # different token (e.g. a PAT) to push docs back.
 #
 # See docs/architecture.md for the full design.
-# Setup (Settings > Secrets and variables > Actions):
-#   Secret   LLM_ENDPOINT  full chat completions URL, e.g. https://<host>/v1/chat/completions
-#   Secret   LLM_API_KEY   bearer token for that API
-#   Variable LLM_MODEL     model name as the API knows it
-# (GitHub Models was retired on 2026-07-30, so it can no longer be used.)
+# Setup: no secrets. The built-in GITHUB_TOKEN authenticates Copilot CLI, which
+# needs the `copilot-requests: write` permission below and the organization
+# policy "Allow use of Copilot CLI billed to the organization" (Copilot policies).
+# Usage is billed to the organization. If that policy can't be enabled, create a
+# fine-grained token with the "Copilot Requests" permission, store it as a secret,
+# and pass it as COPILOT_GITHUB_TOKEN in the generation step instead.
+# (GitHub Models was retired on 2026-07-30. To use another OpenAI-compatible API,
+# set LLM_PROVIDER=api with LLM_ENDPOINT, LLM_API_KEY and MODEL.)
 
 name: Salesforce Docs Agent
 
@@ -49,12 +52,12 @@ concurrency:
 permissions:
   contents: write
   pull-requests: write
+  copilot-requests: write   # lets GITHUB_TOKEN make Copilot CLI requests
 
 env:
   PROJECT_DIR: sample-sfdx-project
   SOURCE_DIR: sample-sfdx-project/force-app
   DOCS_DIR: docs
-  MODEL: ${{ vars.LLM_MODEL }}
   MAX_CONTEXT_CHARS: "30000"
   MAX_COMPONENTS: "25"
   DOCS_BOT_EMAIL: docs-agent@noreply.github.com
@@ -116,6 +119,10 @@ jobs:
           echo y | sf plugins install sfdx-git-delta
           sf --version
 
+      - name: Install Copilot CLI
+        if: steps.guard.outputs.skip != 'true'
+        run: npm install -g @github/copilot
+
       - name: Detect changed metadata
         id: delta
         if: steps.guard.outputs.skip != 'true'
@@ -144,11 +151,11 @@ jobs:
             exit 1
           fi
 
-      - name: Generate documentation with the model API
+      - name: Generate documentation with Copilot CLI
         if: steps.guard.outputs.skip != 'true' && steps.delta.outputs.count != '0'
         env:
-          LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_PROVIDER: copilot
+          GITHUB_TOKEN: ${{ github.token }}
           TO: ${{ steps.range.outputs.to }}
         run: node ci/generate-docs.mjs
 

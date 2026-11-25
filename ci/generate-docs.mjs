@@ -24,9 +24,11 @@
 // No dependencies; needs Node 20+ (global fetch).
 //
 // Environment:
-//   LLM_ENDPOINT         full chat completions URL, e.g. https://<host>/v1/chat/completions (required)
-//   LLM_API_KEY          bearer token for that API (required)
-//   MODEL                model name as the API knows it (required)
+//   LLM_PROVIDER         "copilot" (GitHub Copilot CLI) or "api" (default, OpenAI-compatible)
+//   copilot: GITHUB_TOKEN or COPILOT_GITHUB_TOKEN; MODEL optional; COPILOT_CMD overrides "copilot"
+//   api:     LLM_ENDPOINT  full chat completions URL, e.g. https://<host>/v1/chat/completions
+//            LLM_API_KEY   bearer token for that API
+//            MODEL         model name as the API knows it (required)
 //   SOURCE_DIR           e.g. sample-sfdx-project/force-app
 //   TO                   commit SHA being documented (for deprecation notes)
 //   MAX_CONTEXT_CHARS    total characters of source sent per module (default 30000)
@@ -35,13 +37,16 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 
 const env = process.env;
 const SOURCE_DIR = (env.SOURCE_DIR || "sample-sfdx-project/force-app").replace(/\\/g, "/");
 const MODEL = env.MODEL || "";
 const TO = env.TO || "HEAD";
 const MAX_CONTEXT_CHARS = Number(env.MAX_CONTEXT_CHARS || 30000);
+const PROVIDER = env.LLM_PROVIDER || "api"; // "copilot" or "api"
+const [COPILOT_BIN, ...COPILOT_PREFIX] = (env.COPILOT_CMD || "copilot").split(" ");
+const COPILOT_CMD = [COPILOT_BIN, ...COPILOT_PREFIX].join(" ");
 const ENDPOINT = env.LLM_ENDPOINT || "";
 const API_KEY = env.LLM_API_KEY || "";
 const PROMPT_ONLY = env.PROMPT_ONLY === "true";
@@ -258,6 +263,17 @@ function parseJson(res, body) {
 
 // Fail once with a clear reason instead of failing every module with the same error.
 function preflight() {
+  if (PROVIDER === "copilot") {
+    if (!(env.COPILOT_GITHUB_TOKEN || env.GH_TOKEN || env.GITHUB_TOKEN)) {
+      throw new Error("No token for Copilot CLI: set GITHUB_TOKEN (needs `copilot-requests: write`) or COPILOT_GITHUB_TOKEN.");
+    }
+    const v = spawnSync(COPILOT_BIN, [...COPILOT_PREFIX, "--version"], { encoding: "utf8" });
+    if (v.error || v.status !== 0) {
+      throw new Error(`Cannot run "${COPILOT_CMD}": ${v.error?.message || v.stderr}. Install it with: npm install -g @github/copilot`);
+    }
+    console.log(`preflight: using Copilot CLI ${v.stdout.trim().split("\n")[0]}${MODEL ? `, model ${MODEL}` : ""}`);
+    return;
+  }
   const missing = [["LLM_ENDPOINT", ENDPOINT], ["LLM_API_KEY", API_KEY], ["MODEL", MODEL]]
     .filter(([, v]) => !v)
     .map(([k]) => k);
@@ -267,11 +283,33 @@ function preflight() {
   console.log(`preflight: using model ${MODEL} at ${new URL(ENDPOINT).origin}`);
 }
 
+// Copilot CLI in programmatic mode: -p runs once and exits, -s prints only the
+// answer. No --allow-tool is passed, so every tool request is denied and the
+// model can only reply with the document text.
+function callCopilot(system, user) {
+  const prompt =
+    `${system}\n\nDo not use any tools. Reply with the completed Markdown document only.\n\n---\n\n${user}`;
+  const args = [...COPILOT_PREFIX, "-p", prompt, "-s", ...(MODEL ? ["--model", MODEL] : [])];
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const r = spawnSync(COPILOT_BIN, args, {
+      encoding: "utf8",
+      maxBuffer: 20 * 1024 * 1024,
+      timeout: 10 * 60 * 1000,
+    });
+    const out = (r.stdout || "").trim();
+    if (r.status === 0 && out) return out;
+    const why = r.error?.message || (r.stderr || "").trim().slice(0, 500) || `exit ${r.status}`;
+    if (attempt === 2) throw new Error(`Copilot CLI failed: ${why}`);
+    console.warn(`Copilot CLI failed (${why}), retrying`);
+  }
+}
+
 async function callModel(system, user) {
   if (PROMPT_ONLY) {
     console.log(`----- prompt (${user.length} chars) -----\n${user.slice(0, 1500)}\n...`);
     return null;
   }
+  if (PROVIDER === "copilot") return callCopilot(system, user);
 
   for (let attempt = 1; attempt <= 4; attempt++) {
     const res = await fetch(ENDPOINT, {
