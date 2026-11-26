@@ -27,4 +27,9 @@ public with sharing class AccountService {
             LIMIT :limitCount
         ];
     }
+
+    private static void logAccountUpdate(Account acc) {
+        update acc;
+        System.debug('Account updated: ' + acc.Id + ', New Rating: ' + acc.Rating);
+    }
 }
