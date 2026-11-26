@@ -10,7 +10,7 @@
 
 ## Purpose
 
-This module applies Account rating and industry logic and displays a configurable list of top accounts ranked by annual revenue.
+This module updates Account ratings based on annual revenue, sets a default industry on Account records, and displays a configurable list of top accounts ranked by annual revenue.
 
 ## Components
 
@@ -22,7 +22,7 @@ This module applies Account rating and industry logic and displays a configurabl
 
 ## How the components work together
 
-`accountTopList` calls `AccountService.getTopAccounts` and renders the returned Accounts. `AccountTrigger` runs separately on Account inserts and updates to set `Industry` to `Other` when it is blank. `AccountService.updateAccountRatings` queries Accounts and updates their `Rating` values.
+`accountTopList` calls `AccountService.getTopAccounts` and renders the returned Accounts. `AccountTrigger` runs separately on Account inserts and updates to set `Industry` to `Other` when it is blank. `AccountService.updateAccountRatings` queries Accounts and updates their `Rating` values based on `AnnualRevenue`.
 
 ## Component details
 
@@ -34,9 +34,8 @@ This module applies Account rating and industry logic and displays a configurabl
 - **Public interface:**
   - `public static void updateAccountRatings(Set<Id> accountIds)`
   - `@AuraEnabled(cacheable=true) public static List<Account> getTopAccounts(Integer limitCount)`
-- **Behavior:** `updateAccountRatings` queries `Account.Id`, `AnnualRevenue`, and `Rating` for the supplied IDs. It sets `Rating` to `Hot` when `AnnualRevenue` is at least `10000000`; otherwise, it sets `Rating` to `Warm`. It then updates the queried Accounts.
-- **Apex entry point:** `getTopAccounts` is available to Lightning components.
-- **Private method:** `logAccountUpdate(Account acc)` updates the supplied Account and writes its Id and Rating to `System.debug`.
+- **Behavior:** `updateAccountRatings` queries `Account.Id`, `Account.AnnualRevenue`, and `Account.Rating` for the supplied IDs. It sets `Rating` to `Hot` when `Account.AnnualRevenue` is at least `10000000`, `Warm` when it is at least `5000000`, and `Cold` otherwise, including when `AnnualRevenue` is null. It then updates the queried Accounts.
+- **Apex entry point:** `getTopAccounts` is available to Lightning components. It queries `Account.Id`, `Account.Name`, and `Account.AnnualRevenue`, orders records by `Account.AnnualRevenue` descending with null values last, and applies `limitCount`.
 
 ### AccountTrigger (Apex trigger)
 
@@ -69,7 +68,7 @@ This module applies Account rating and industry logic and displays a configurabl
 ## Tests
 
 - **Test classes:** `AccountServiceTest`
-- **Coverage notes:** `testUpdateAccountRatings` creates Accounts with `AnnualRevenue` values of `5000000` and `10000`, then expects `Rating` values of `Hot` and `Warm`. The test expectation for the `5000000` Account conflicts with the `10000000` threshold in `updateAccountRatings`; the test may fail. Other coverage information is not available.
+- **Coverage notes:** `testUpdateAccountRatings` creates Accounts with `AnnualRevenue` values of `5000000` and `10000`, then expects `Rating` values of `Hot` and `Warm`. The implementation sets these ratings to `Warm` and `Cold`, respectively, so both assertions conflict with the implementation and may fail. Other coverage information is not available.
 
 ## Removed components
 
@@ -77,9 +76,9 @@ None.
 
 ## Change history
 
+- 2026-11-26 — Yaswanth Tikkisetti — Added a new status option canclled field for Invoice Status and one more check for 5000000 for warm
+- 2026-11-26 — Yaswanth Tikkisetti — Removed the private method which is not used anywhere
 - 2026-11-26 — Yaswanth Tikkisetti — Test Account Service Updates with logAccount method
-- 2026-11-25 — yaswanthEPAM — Update AccountService to change revenue threshold
-- 2026-11-19 — Sai Krishna Gadiyakari — Add Salesforce documentation agent POC
 
 ## Manual notes
 

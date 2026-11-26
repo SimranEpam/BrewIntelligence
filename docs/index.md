@@ -6,7 +6,8 @@
 
 | Module | Summary |
 |---|---|
-| [Account Management](modules/account-management.md) | This module applies Account rating and industry logic and displays a configurable list of top accounts ranked by annual revenue. |
+| [Account Management](modules/account-management.md) | This module updates Account ratings based on annual revenue, sets a default industry on Account records, and displays a configurable list... |
+| [Invoicing](modules/invoicing.md) | Invoice__c stores invoice records and their amount and status. Invoice_Validate_Amount validates new or updated invoices before they are ... |
 
 ## Object relationships
 
