@@ -1,19 +1,28 @@
 # Salesforce Documentation Agent
 #
-# On every pull request (opened/updated) that touches Salesforce metadata in
-# the sample project:
-#   1. Detect changed metadata between the PR's base and head (git diff + sfdx-git-delta)
+# On every push, and on every pull request (opened/updated), that touches
+# Salesforce metadata in the sample project:
+#   1. Detect changed metadata for the event's own range (git diff + sfdx-git-delta)
 #   2. Map each changed component to its module (docs/modules.json) and update
 #      one document per affected module, docs/modules/<module>.md, with
 #      GitHub Copilot CLI (ci/generate-docs.mjs)
 #   3. Check the output (placeholders, secrets, record IDs, "Manual notes")
-#   4. Commit the generated docs directly onto the PR's own branch
+#   4. Commit the generated docs back onto the branch that was pushed
 #
-# Docs are generated once, at PR time, so the PR is reviewed and merged with
-# its documentation already in place. Follow-up commits to the same PR
-# (`synchronize`) re-run the agent; the loop guard below skips the run when
-# the triggering commit is the agent's own docs commit, so it won't trigger
-# itself forever.
+# Both triggers are needed, and they do different jobs:
+#   - `push` covers every commit to any branch, whether or not a pull request
+#     is open. This is what keeps docs up to date when a component is changed
+#     again later: an existing docs/modules/<module>.md is regenerated, not
+#     just created the first time.
+#   - `pull_request` covers `opened`/`reopened`, where a PR is raised against
+#     commits that were already pushed, so no push event fires.
+# The concurrency group is keyed on the branch, so when both fire for the same
+# branch they do not race to commit docs.
+#
+# The agent commits with GITHUB_TOKEN, and GitHub does not start new workflow
+# runs from GITHUB_TOKEN pushes, so the docs commit cannot re-trigger this
+# workflow. The loop guard below is a second line of defence for the case
+# where that commit reaches the branch some other way.
 #
 # Limitation: pull_request runs from a forked repository get a read-only
 # GITHUB_TOKEN, so the push step will fail for fork PRs. That's fine for this
@@ -33,6 +42,12 @@
 name: Salesforce Docs Agent
 
 on:
+  push:
+    # Branches only. A tag push has no branch to commit docs back to.
+    branches:
+      - "**"
+    paths:
+      - "sample-sfdx-project/force-app/**"
   pull_request:
     types: [opened, synchronize, reopened]
     paths:
@@ -44,9 +59,11 @@ on:
         type: boolean
         default: false
 
-# A new push to the PR supersedes any in-flight run for that same PR.
+# Keyed on the branch, not the PR, so a push event and a pull_request event for
+# the same branch share one group instead of both committing docs. A newer
+# commit supersedes any in-flight run for that branch.
 concurrency:
-  group: salesforce-docs-${{ github.event.pull_request.number || 'manual' }}
+  group: salesforce-docs-${{ github.event.pull_request.head.ref || github.ref_name }}
   cancel-in-progress: true
 
 permissions:
@@ -69,7 +86,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
 
     steps:
-      - name: Check out PR head branch
+      - name: Check out the commit being documented
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -78,33 +95,79 @@ jobs:
       - name: Skip if triggered by the docs agent's own commit
         id: guard
         run: |
+          set -euo pipefail
           AUTHOR_EMAIL="$(git log -1 --format='%ae')"
           SUBJECT="$(git log -1 --format='%s')"
-          if [ "${AUTHOR_EMAIL}" = "${DOCS_BOT_EMAIL}" ] || [[ "${SUBJECT}" == docs:* ]]; then
+
+          # Match on the agent's own author identity, and on the exact subject
+          # it writes. A bare "docs:*" prefix would also swallow a developer's
+          # own commit (e.g. "docs: fix typo") that changes metadata, and that
+          # change would then never be documented.
+          if [ "${AUTHOR_EMAIL}" = "${DOCS_BOT_EMAIL}" ] \
+             || [[ "${SUBJECT}" == "docs: update documentation for "* ]]; then
             echo "Head commit was made by the docs agent itself; skipping to avoid a trigger loop."
+            echo "Skipped: head commit \`${SUBJECT}\` is the docs agent's own." >> "$GITHUB_STEP_SUMMARY"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
+            echo "Documenting commit: ${SUBJECT} (${AUTHOR_EMAIL})"
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Resolve diff range
         id: range
         if: steps.guard.outputs.skip != 'true'
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            FROM="${{ github.event.pull_request.base.sha }}"
-            TO="${{ github.event.pull_request.head.sha }}"
+          set -euo pipefail
+          EMPTY_TREE="$(git hash-object -t tree /dev/null)"
+
+          # Usable only if it is a real commit we actually have (a deleted
+          # branch, a force-push or a brand-new branch gives us a zero SHA or
+          # an unreachable one).
+          have_commit() {
+            case "$1" in ""|0000000000000000000000000000000000000000) return 1 ;; esac
+            git cat-file -e "$1^{commit}" 2>/dev/null
+          }
+
+          if [ "${EVENT_NAME}" = "pull_request" ]; then
+            # Whole PR: base..head, so a module is documented from the full
+            # change set even if an earlier run was cancelled or skipped.
+            TO="${PR_HEAD_SHA}"
+            FROM="${PR_BASE_SHA}"
           else
             TO="${GITHUB_SHA}"
-            if git rev-parse --verify --quiet "${TO}~1" > /dev/null; then
+            # Incremental: just what this push added. github.event.before spans
+            # every commit in the push; TO~1 would miss all but the last.
+            if have_commit "${PUSH_BEFORE_SHA}"; then
+              FROM="${PUSH_BEFORE_SHA}"
+            elif git rev-parse --verify --quiet "${TO}~1" > /dev/null; then
               FROM="$(git rev-parse "${TO}~1")"
             else
-              FROM="$(git hash-object -t tree /dev/null)"
+              FROM="${EMPTY_TREE}"
             fi
           fi
+
+          # A base we cannot read (force-push, cross-fork, truncated history)
+          # would fail the diff. Fall back to the merge base, then to TO~1.
+          if ! have_commit "${FROM}"; then
+            if git merge-base "${FROM}" "${TO}" > /dev/null 2>&1; then
+              FROM="$(git merge-base "${FROM}" "${TO}")"
+            elif git rev-parse --verify --quiet "${TO}~1" > /dev/null; then
+              echo "::warning::Base ${FROM} is unavailable; comparing against ${TO}~1 instead."
+              FROM="$(git rev-parse "${TO}~1")"
+            else
+              echo "::warning::Base ${FROM} is unavailable; treating every component as new."
+              FROM="${EMPTY_TREE}"
+            fi
+          fi
+
           echo "from=${FROM}" >> "$GITHUB_OUTPUT"
           echo "to=${TO}"     >> "$GITHUB_OUTPUT"
-          echo "Comparing ${FROM}..${TO}"
+          echo "Comparing ${FROM}..${TO} (event: ${EVENT_NAME})"
 
       - name: Set up Node.js
         if: steps.guard.outputs.skip != 'true'
@@ -146,6 +209,18 @@ jobs:
 
           COUNT=$(wc -l < .sgd/changed-files.txt | tr -d ' ')
           echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
+          if [ "${COUNT}" = "0" ]; then
+            echo "No Salesforce metadata changed in this range; nothing to document." \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "### Changed metadata (${COUNT} file(s))"
+              echo
+              echo '```'
+              cat .sgd/changed-files.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
           if [ "${COUNT}" -gt "${MAX_COMPONENTS}" ]; then
             echo "::error::${COUNT} changed files exceeds MAX_COMPONENTS=${MAX_COMPONENTS}. Run manually with a narrower range."
             exit 1
@@ -209,8 +284,14 @@ jobs:
             echo "===== $f ====="; cat "$f"
           done
 
-      - name: Commit documentation to the PR branch
-        if: steps.guard.outputs.skip != 'true' && steps.delta.outputs.count != '0' && !inputs.dry_run && github.event_name == 'pull_request'
+      - name: Commit documentation to the branch
+        if: steps.guard.outputs.skip != 'true' && steps.delta.outputs.count != '0' && !inputs.dry_run && github.event_name != 'workflow_dispatch'
+        env:
+          # Branch to push docs back to: the PR's head branch, or the branch
+          # that was pushed. Passed through env so an unusual branch name
+          # cannot be interpolated into the script.
+          TARGET_REF: ${{ github.event.pull_request.head.ref || github.ref_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
           git config user.name "docs-agent"
@@ -221,9 +302,39 @@ jobs:
           done
 
           if git diff --cached --quiet; then
-            echo "Nothing to commit."
+            echo "Nothing to commit: the regenerated docs match what is already on ${TARGET_REF}."
+            echo "No documentation changes for \`${TARGET_REF}\`." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
-          git commit -m "docs: update documentation for PR #${{ github.event.pull_request.number }}"
-          git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
+          if [ -n "${PR_NUMBER}" ]; then
+            MSG="docs: update documentation for PR #${PR_NUMBER}"
+          else
+            MSG="docs: update documentation for ${GITHUB_SHA:0:7}"
+          fi
+
+          git commit -m "${MSG}"
+
+          # Another commit may have landed while the agent was generating.
+          # Rebase the docs commit onto it rather than failing the run.
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:${TARGET_REF}"; then
+              echo "Pushed docs to ${TARGET_REF}."
+              {
+                echo "### Documentation updated"
+                echo
+                git show --stat --oneline HEAD | sed '1d'
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "Push rejected (attempt ${attempt}); rebasing onto origin/${TARGET_REF}."
+            git fetch origin "${TARGET_REF}"
+            if ! git rebase "origin/${TARGET_REF}"; then
+              git rebase --abort || true
+              echo "::error::Docs commit conflicts with ${TARGET_REF}. Re-run the workflow for the latest commit."
+              exit 1
+            fi
+          done
+
+          echo "::error::Could not push documentation to ${TARGET_REF} after 3 attempts."
+          exit 1
