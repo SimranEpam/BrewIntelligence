@@ -6,7 +6,8 @@
 
 | Module | Summary |
 |---|---|
-| [Account Management](modules/account-management.md) | This module updates Account ratings based on annual revenue, provides the top accounts to an LWC, and assigns a default Industry value wh... |
+| [Account Management](modules/account-management.md) | This module updates `Account.Rating` based on `Account.AnnualRevenue`, retrieves top accounts for an LWC, and sets a default `Account.Ind... |
+| [Invoicing](modules/invoicing.md) | This module defines the `Invoice__c` custom object and a before-save flow that validates invoice amounts and initializes blank statuses. |
 
 ## Object relationships
 

@@ -10,21 +10,21 @@
 
 ## Purpose
 
-This module updates Account ratings based on annual revenue, provides the top accounts to an LWC, and assigns a default Industry value when an Account is created or updated.
+This module updates `Account.Rating` based on `Account.AnnualRevenue`, retrieves top accounts for an LWC, and sets a default `Account.Industry` value when an Account is created or updated.
 
 ## Components
 
 | Component | Type | Purpose |
 |---|---|---|
 | AccountService | Apex class | Updates Account ratings and retrieves accounts ordered by annual revenue. |
-| AccountTrigger | Apex trigger | Sets a blank Account Industry to `Other` before insert or update. |
+| AccountTrigger | Apex trigger | Sets a blank `Account.Industry` to `Other` before insert or update. |
 | accountTopList | LWC | Displays a configurable list of accounts with the highest annual revenue. |
 
 ## How the components work together
 
 - `accountTopList` calls `AccountService.getTopAccounts` through an `@AuraEnabled` wire service and renders returned Account names.
 - `AccountTrigger` independently sets blank `Account.Industry` values to `Other` during Account insert and update operations.
-- `AccountService.updateAccountRatings` can update Account ratings based on `Account.AnnualRevenue`; no call to this method is present in the LWC or trigger source.
+- `AccountService.updateAccountRatings` queries and updates Account ratings based on `Account.AnnualRevenue`; no call to this method is present in the LWC or trigger source.
 
 ## Component details
 
@@ -34,9 +34,9 @@ This module updates Account ratings based on annual revenue, provides the top ac
 - **API version:** 62.0
 - **Status:** Active
 - **Methods:**
-  - `public static void updateAccountRatings(Set<Id> accountIds)`: Queries `Account.Id`, `Account.AnnualRevenue`, and `Account.Rating`, sets `Account.Rating` to `Hot` when `AnnualRevenue` is at least 10,000,000 and `Warm` otherwise, then updates the queried records.
-  - `@AuraEnabled(cacheable=true) public static List<Account> getTopAccounts(Integer limitCount)`: Queries `Account.Id`, `Account.Name`, and `Account.AnnualRevenue`, orders records by `AnnualRevenue` descending with nulls last, and applies `limitCount`.
-  - `private static void logAccountUpdate(Account acc)`: Updates the supplied Account and writes its Id and Rating to `System.debug`. No call to this private method appears in the source.
+  - `public static void updateAccountRatings(Set<Id> accountIds)`: Queries `Account.Id`, `Account.AnnualRevenue`, and `Account.Rating`. Sets `Account.Rating` to `Hot` at annual revenue of 10,000,000 or more, `Warm` at 5,000,000 or more, and `Cold` otherwise, then updates the queried records.
+  - `@AuraEnabled(cacheable=true) public static List<Account> getTopAccounts(Integer limitCount)`: Queries `Account.Id`, `Account.Name`, and `Account.AnnualRevenue`, orders by `AnnualRevenue` descending with nulls last, and applies `limitCount`.
+  - `private static void logAccountUpdate(Account acc)`: Updates the supplied Account and writes its Id and Rating to `System.debug`. No call to this method appears in the source.
 
 ### AccountTrigger (Apex trigger)
 
@@ -61,14 +61,14 @@ This module updates Account ratings based on annual revenue, provides the top ac
 
 ## Salesforce considerations
 
-- Governor limits: No SOQL or DML inside loops found. `updateAccountRatings` performs one SOQL query and one DML update; `getTopAccounts` performs one SOQL query.
-- Bulkification: Partial. `updateAccountRatings` processes a list in one DML operation, and `AccountTrigger` processes `Trigger.new` as a collection, but there is no explicit bulk-specific handling for the private `logAccountUpdate` method.
+- Governor limits: No SOQL or DML inside loops found. `updateAccountRatings` performs one SOQL query and one DML update outside the loop; `getTopAccounts` performs one SOQL query.
+- Bulkification: Partial. `updateAccountRatings` processes queried records in a loop and updates the list once; `AccountTrigger` processes `Trigger.new` as a collection.
 - Security: `AccountService` uses `with sharing`. No explicit CRUD or FLS checks are present in `AccountService` or `AccountTrigger`.
 
 ## Tests
 
 - Test classes: `AccountServiceTest`
-- Coverage notes: Not available
+- Coverage notes: The test creates Accounts with annual revenue of 5,000,000 and 10,000, but asserts `Hot` and `Warm`. Under the current `updateAccountRatings` thresholds, the 5,000,000 Account should be `Warm` and the 10,000 Account should be `Cold`.
 
 ## Removed components
 
@@ -76,9 +76,9 @@ None.
 
 ## Change history
 
+- 2026-11-26 — Yaswanth Tikkisetti — Added new condition for rating and Status field value for cancelled updates
 - 2026-11-26 — Yaswanth Tikkisetti — Added logAccount method to update account
 - 2026-11-25 — yaswanthEPAM — Update AccountService to change revenue threshold
-- 2026-11-19 — Sai Krishna Gadiyakari — Add Salesforce documentation agent POC
 
 ## Manual notes
 
