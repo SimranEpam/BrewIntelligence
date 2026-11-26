@@ -1,28 +1,34 @@
 # Salesforce Documentation Agent
 #
-# On every push, and on every pull request (opened/updated), that touches
-# Salesforce metadata in the sample project:
-#   1. Detect changed metadata for the event's own range (git diff + sfdx-git-delta)
+# When a pull request is opened (or reopened) against Salesforce metadata in
+# the sample project:
+#   1. Detect changed metadata across the whole PR (git diff + sfdx-git-delta)
 #   2. Map each changed component to its module (docs/modules.json) and update
 #      one document per affected module, docs/modules/<module>.md, with
 #      GitHub Copilot CLI (ci/generate-docs.mjs)
 #   3. Check the output (placeholders, secrets, record IDs, "Manual notes")
-#   4. Commit the generated docs back onto the branch that was pushed
+#   4. Commit the generated docs onto the PR's own branch
 #
-# Both triggers are needed, and they do different jobs:
-#   - `push` covers every commit to any branch, whether or not a pull request
-#     is open. This is what keeps docs up to date when a component is changed
-#     again later: an existing docs/modules/<module>.md is regenerated, not
-#     just created the first time.
-#   - `pull_request` covers `opened`/`reopened`, where a PR is raised against
-#     commits that were already pushed, so no push event fires.
-# The concurrency group is keyed on the branch, so when both fire for the same
-# branch they do not race to commit docs.
+# Deliberately ONE run per pull request: `opened` and `reopened` only, no
+# `synchronize` and no `push`. The trade-off is explicit — a component that is
+# changed again in a later commit on the same PR keeps the document written
+# from its state when the PR was opened. Nothing re-runs by itself.
+#
+# So if a doc looks out of date, that is this trigger choice, not a bug in the
+# detection: the agent regenerates an existing docs/modules/<module>.md
+# perfectly well, it just is not asked to. To refresh a doc without opening a
+# new PR, close and reopen the PR, or run the workflow manually and commit the
+# result. To document every commit instead, add `synchronize` to the types
+# below (per-commit inside a PR) or a `push` trigger (every commit on every
+# branch); both cost one Copilot CLI call per commit.
+#
+# The range is the PR's base..head rather than the newest commit, so a single
+# run covers every component the PR touches.
 #
 # The agent commits with GITHUB_TOKEN, and GitHub does not start new workflow
-# runs from GITHUB_TOKEN pushes, so the docs commit cannot re-trigger this
-# workflow. The loop guard below is a second line of defence for the case
-# where that commit reaches the branch some other way.
+# runs from GITHUB_TOKEN pushes. With `synchronize` absent, the docs commit
+# cannot re-trigger this workflow at all. The loop guard below is a second line
+# of defence for the case where that commit reaches the branch some other way.
 #
 # Limitation: pull_request runs from a forked repository get a read-only
 # GITHUB_TOKEN, so the push step will fail for fork PRs. That's fine for this
@@ -42,14 +48,9 @@
 name: Salesforce Docs Agent
 
 on:
-  push:
-    # Branches only. A tag push has no branch to commit docs back to.
-    branches:
-      - "**"
-    paths:
-      - "sample-sfdx-project/force-app/**"
   pull_request:
-    types: [opened, synchronize, reopened]
+    # No `synchronize`: commits pushed to an open PR do not re-run the agent.
+    types: [opened, reopened]
     paths:
       - "sample-sfdx-project/force-app/**"
   workflow_dispatch:
@@ -59,9 +60,8 @@ on:
         type: boolean
         default: false
 
-# Keyed on the branch, not the PR, so a push event and a pull_request event for
-# the same branch share one group instead of both committing docs. A newer
-# commit supersedes any in-flight run for that branch.
+# Keyed on the branch so a reopen while a run is still going does not leave two
+# runs committing docs to the same branch.
 concurrency:
   group: salesforce-docs-${{ github.event.pull_request.head.ref || github.ref_name }}
   cancel-in-progress: true
@@ -120,31 +120,26 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PUSH_BEFORE_SHA: ${{ github.event.before }}
         run: |
           set -euo pipefail
           EMPTY_TREE="$(git hash-object -t tree /dev/null)"
 
-          # Usable only if it is a real commit we actually have (a deleted
-          # branch, a force-push or a brand-new branch gives us a zero SHA or
-          # an unreachable one).
+          # Usable only if it is a real commit we actually have (a force-pushed
+          # or cross-fork base gives us a zero SHA or an unreachable one).
           have_commit() {
             case "$1" in ""|0000000000000000000000000000000000000000) return 1 ;; esac
             git cat-file -e "$1^{commit}" 2>/dev/null
           }
 
           if [ "${EVENT_NAME}" = "pull_request" ]; then
-            # Whole PR: base..head, so a module is documented from the full
-            # change set even if an earlier run was cancelled or skipped.
+            # Whole PR: base..head. With one run per PR this is the only range
+            # that covers every component the PR touches.
             TO="${PR_HEAD_SHA}"
             FROM="${PR_BASE_SHA}"
           else
+            # workflow_dispatch: document the commit the workflow was run on.
             TO="${GITHUB_SHA}"
-            # Incremental: just what this push added. github.event.before spans
-            # every commit in the push; TO~1 would miss all but the last.
-            if have_commit "${PUSH_BEFORE_SHA}"; then
-              FROM="${PUSH_BEFORE_SHA}"
-            elif git rev-parse --verify --quiet "${TO}~1" > /dev/null; then
+            if git rev-parse --verify --quiet "${TO}~1" > /dev/null; then
               FROM="$(git rev-parse "${TO}~1")"
             else
               FROM="${EMPTY_TREE}"
@@ -284,13 +279,12 @@ jobs:
             echo "===== $f ====="; cat "$f"
           done
 
-      - name: Commit documentation to the branch
-        if: steps.guard.outputs.skip != 'true' && steps.delta.outputs.count != '0' && !inputs.dry_run && github.event_name != 'workflow_dispatch'
+      - name: Commit documentation to the PR branch
+        if: steps.guard.outputs.skip != 'true' && steps.delta.outputs.count != '0' && !inputs.dry_run && github.event_name == 'pull_request'
         env:
-          # Branch to push docs back to: the PR's head branch, or the branch
-          # that was pushed. Passed through env so an unusual branch name
+          # The PR's head branch. Passed through env so an unusual branch name
           # cannot be interpolated into the script.
-          TARGET_REF: ${{ github.event.pull_request.head.ref || github.ref_name }}
+          TARGET_REF: ${{ github.event.pull_request.head.ref }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
@@ -307,16 +301,10 @@ jobs:
             exit 0
           fi
 
-          if [ -n "${PR_NUMBER}" ]; then
-            MSG="docs: update documentation for PR #${PR_NUMBER}"
-          else
-            MSG="docs: update documentation for ${GITHUB_SHA:0:7}"
-          fi
+          git commit -m "docs: update documentation for PR #${PR_NUMBER}"
 
-          git commit -m "${MSG}"
-
-          # Another commit may have landed while the agent was generating.
-          # Rebase the docs commit onto it rather than failing the run.
+          # A developer may have pushed to the PR while the agent was
+          # generating. Rebase the docs commit onto it rather than failing.
           for attempt in 1 2 3; do
             if git push origin "HEAD:${TARGET_REF}"; then
               echo "Pushed docs to ${TARGET_REF}."
